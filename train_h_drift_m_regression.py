@@ -1,6 +1,5 @@
 import os
 import random
-import math
 import numpy as np
 from dataclasses import dataclass
 from typing import Tuple
@@ -10,220 +9,182 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from PIL import Image, ImageEnhance, ImageFilter
-from scipy.ndimage import convolve  # Added for flexible kernel sizes
+from scipy.ndimage import convolve
 
 import matplotlib.pyplot as plt
 
 # -------------------------
-# Reproducibility
-# -------------------------
-def seed_everything(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-# -------------------------
-# Config
+# Config: Tier 1 & 2 Master Upgrades
 # -------------------------
 @dataclass
 class Config:
-    # Ensure this directory exists and contains your "gold" images
+    # 1. Update this to your high-quality nerve image folder
     data_dir: str = "data/train/good" 
     image_size: int = 224
-    batch_size: int = 8
-    epochs: int = 15
-    lr: float = 1e-3
+    batch_size: int = 16
+    epochs: int = 50  # Increased for deeper head convergence
+    lr: float = 1e-4  # Slower for regression precision
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    num_workers: int = 0
-    save_dir: str = "outputs_h_drift_m"
+    save_dir: str = "outputs_h_drift_m_v2"
 
-    # Degradation ranges for the Virtual Sensor
-    defocus_sigma: Tuple[float, float] = (0.0, 3.0) # For dz
-    illum_scale: Tuple[float, float] = (0.6, 1.1)   # For dI
-    noise_std: Tuple[float, float] = (0.0, 0.05)
-
-    # Structural/Knife Smear ranges
-    motion_len_min: int = 3
-    motion_len_max: int = 15
+    # 2. Expanded Ranges (Metrology Limits)
+    defocus_max: float = 6.0   # dz: Up to 6.0 pixels (Extreme blur)
+    illum_min: float = 0.5     # dI: Up to 50% light loss
+    motion_max: int = 25       # dK: Up to 25 pixel knife smear
 
 # -------------------------
-# Corrected Motion Blur (Fixed ValueError)
+# Physics-Based Degradation
 # -------------------------
-def motion_blur_np(img: Image.Image, length: int, angle_deg: float) -> Image.Image:
-    """
-    Uses scipy.ndimage.convolve to handle arbitrary kernel sizes, 
-    solving the PIL 'bad kernel size' error.
-    """
-    if length < 3:
-        return img
-
-    # Create a horizontal line kernel
+def apply_motion_blur(img: Image.Image, length: int, angle_deg: float) -> Image.Image:
+    """Simulates knife/microtome smear using custom convolution."""
+    if length < 3: return img
     kernel = np.zeros((length, length), dtype=np.float32)
     kernel[length // 2, :] = 1.0
-    
-    # Rotate kernel using PIL to the specific drift angle
     ker_img = Image.fromarray((kernel * 255).astype(np.uint8), mode="L")
     ker_img = ker_img.rotate(angle_deg, resample=Image.BILINEAR)
     ker = np.array(ker_img).astype(np.float32)
-    
-    # Normalize kernel
-    if ker.sum() <= 0:
-        return img
+    if ker.sum() <= 0: return img
     ker /= ker.sum()
-
-    # Apply convolution to RGB channels
     img_array = np.array(img).astype(np.float32)
-    channels = []
-    for i in range(3): # Apply to R, G, and B
-        channels.append(convolve(img_array[:, :, i], ker))
-    
-    out_array = np.stack(channels, axis=2)
-    out_array = np.clip(out_array, 0, 255).astype(np.uint8)
-    
-    return Image.fromarray(out_array)
+    out_channels = [convolve(img_array[:, :, i], ker) for i in range(3)]
+    return Image.fromarray(np.stack(out_channels, axis=2).clip(0, 255).astype(np.uint8))
 
-# -------------------------
-# Degradation + Label Generation
-# -------------------------
-def degrade_and_label(img: Image.Image, cfg: Config):
-    # Randomly sample drift magnitudes
-    dz = random.uniform(*cfg.defocus_sigma)
-    dI = random.uniform(*cfg.illum_scale)
-    dK = random.uniform(0.0, 1.0) # Probability/Intensity of structural drift
+def degrade_and_normalize(img: Image.Image, cfg: Config):
+    """
+    Creates the 'Label Normalized' training pair.
+    dz_raw (0-6) -> dz_norm (0-1)
+    dI_raw (1.0-0.5) -> dI_norm (0-1)
+    dK_prob (0-1) -> dK_norm (0-1)
+    """
+    # Sampling raw drift values
+    dz_raw = random.uniform(0.0, cfg.defocus_max)
+    dI_raw = random.uniform(cfg.illum_min, 1.0)
+    dK_prob = random.uniform(0.0, 1.0) 
 
     out = img
+    # Apply Blur
+    if dz_raw > 0.1:
+        out = out.filter(ImageFilter.GaussianBlur(radius=dz_raw))
+    # Apply Lighting Loss
+    out = ImageEnhance.Brightness(out).enhance(dI_raw)
+    # Apply Structural Smear
+    if dK_prob > 0.2: 
+        length = int(dK_prob * cfg.motion_max) 
+        out = apply_motion_blur(out, length, random.uniform(0, 180))
 
-    # 1. Axial Defocus (dz)
-    if dz > 0:
-        out = out.filter(ImageFilter.GaussianBlur(radius=dz))
+    # --- NORMALIZE TARGETS TO 0-1 RANGE ---
+    dz_norm = dz_raw / cfg.defocus_max
+    dI_norm = (1.0 - dI_raw) / (1.0 - cfg.illum_min)
+    dK_norm = dK_prob 
 
-    # 2. Illumination Decay (dI)
-    out = ImageEnhance.Brightness(out).enhance(dI)
-
-    # 3. Structural / Knife Smear (dK)
-    if random.random() < dK:
-        length = random.randint(cfg.motion_len_min, cfg.motion_len_max)
-        angle = random.uniform(0, 180)
-        out = motion_blur_np(out, length, angle)
-
-    # 4. Sensor Noise
-    n_std = random.uniform(*cfg.noise_std)
-    if n_std > 0:
-        arr = np.array(out).astype(np.float32) / 255.0
-        arr += np.random.normal(0, n_std, arr.shape)
-        arr = np.clip(arr, 0, 1)
-        out = Image.fromarray((arr * 255).astype(np.uint8))
-
-    # Label y = [defocus, illumination_loss, structural_smear]
-    y = np.array([dz, 1.0 - dI, dK], dtype=np.float32)
+    y = np.array([dz_norm, dI_norm, dK_norm], dtype=np.float32)
     return out, y
 
 # -------------------------
-# Dataset
+# Dataset & Model
 # -------------------------
 class DriftDataset(Dataset):
-    def __init__(self, root: str, cfg: Config, tfm):
-        if not os.path.exists(root):
-            raise FileNotFoundError(f"Directory {root} not found. Please add 'good' images.")
-        self.paths = [os.path.join(root, f) for f in os.listdir(root)
-                      if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-        self.cfg = cfg
-        self.tfm = tfm
-
-    def __len__(self):
-        return len(self.paths)
-
+    def __init__(self, root, cfg, tfm):
+        self.paths = [os.path.join(root, f) for f in os.listdir(root) 
+                      if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        self.cfg, self.tfm = cfg, tfm
+    def __len__(self): return len(self.paths)
     def __getitem__(self, idx):
         img = Image.open(self.paths[idx]).convert("RGB")
-        img_deg, y = degrade_and_label(img, self.cfg)
+        img_deg, y = degrade_and_normalize(img, self.cfg)
         return self.tfm(img_deg), torch.tensor(y)
 
-# -------------------------
-# H-DRIFT-M Model Architecture
-# -------------------------
 class HDRIFTM(nn.Module):
     def __init__(self):
         super().__init__()
-        # ResNet18 serves as the CNN feature extractor
+        # CNN Feature Extractor
         base = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         self.backbone = nn.Sequential(*list(base.children())[:-1])
-        # Regression head outputting 3 drift values
-        self.head = nn.Linear(512, 3) 
+        
+        # Deeper Regression Head (PhD Upgrade)
+        self.head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2), # Prevents overfitting to specific nerve samples
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 3) 
+        )
 
     def forward(self, x):
         f = self.backbone(x).flatten(1)
         return self.head(f)
 
 # -------------------------
-# Execution
+# Main Execution
 # -------------------------
 def main():
     cfg = Config()
     os.makedirs(cfg.save_dir, exist_ok=True)
-    seed_everything()
-
-    # Standard ImageNet normalization
+    
     tfm = transforms.Compose([
         transforms.Resize((cfg.image_size, cfg.image_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406),
-                             std=(0.229, 0.224, 0.225))
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
     ])
 
-    ds = DriftDataset(cfg.data_dir, cfg, tfm)
-    loader = DataLoader(ds, batch_size=cfg.batch_size,
-                        shuffle=True, num_workers=cfg.num_workers)
-
+    loader = DataLoader(DriftDataset(cfg.data_dir, cfg, tfm), batch_size=cfg.batch_size, shuffle=True)
     model = HDRIFTM().to(cfg.device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-    loss_fn = nn.MSELoss() # Minimizing the error between predicted and true drift
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    loss_fn = nn.SmoothL1Loss() # Robust Huber Loss
 
-    print(f"Starting H-DRIFT-M training on {cfg.device}...")
+    print(f"Starting H-DRIFT-M Optimization on {cfg.device}...")
 
+    # --- Training Loop ---
     for ep in range(cfg.epochs):
         model.train()
-        loss_sum = 0
-
+        total_loss = 0
         for x, y in loader:
             x, y = x.to(cfg.device), y.to(cfg.device)
-            opt.zero_grad()
+            optimizer.zero_grad()
             pred = model(x)
-            loss = loss_fn(pred, y)
+            
+            # Weighted Loss: Prioritize Focus(dz) and Smear(dK)
+            loss = (2.0 * loss_fn(pred[:, 0], y[:, 0])) + \
+                   (1.0 * loss_fn(pred[:, 1], y[:, 1])) + \
+                   (2.0 * loss_fn(pred[:, 2], y[:, 2]))
+            
             loss.backward()
-            opt.step()
-            loss_sum += loss.item()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        if (ep+1) % 5 == 0:
+            print(f"Epoch {ep+1:02d}/{cfg.epochs} | Loss: {total_loss/len(loader):.6f}")
 
-        print(f"Epoch {ep+1:02d}/{cfg.epochs} | Avg MSE Loss: {loss_sum/len(loader):.6f}")
+    # Save finalized model
+    torch.save(model.state_dict(), os.path.join(cfg.save_dir, "h_drift_m_v2.pt"))
 
-    # Save for integration into main(1).py
-    torch.save(model.state_dict(), os.path.join(cfg.save_dir, "h_drift_m_v_sensor.pt"))
-    print(f"Model saved to {cfg.save_dir}/h_drift_m_v_sensor.pt")
-
-    # -------------------------
-    # Regression Performance Visualization
-    # -------------------------
+    # --- AUTO-GENERATION OF SCATTER PLOTS ---
+    print("Generating Calibration Curves...")
     model.eval()
-    preds, gts = [], []
+    all_preds, all_gts = [], []
     with torch.no_grad():
         for x, y in loader:
             x = x.to(cfg.device)
-            preds.append(model(x).cpu().numpy())
-            gts.append(y.numpy())
+            all_preds.append(model(x).cpu().numpy())
+            all_gts.append(y.numpy())
 
-    P = np.concatenate(preds)
-    G = np.concatenate(gts)
-    names = ["Axial Drift (dz)", "Illumination Drift (dI)", "Structural Drift (dK)"]
-
+    P, G = np.concatenate(all_preds), np.concatenate(all_gts)
+    names = ["Axial Drift (dz)", "Illumination (dI)", "Structural Smear (dK)"]
+    
     for i in range(3):
-        plt.figure(figsize=(6, 5))
-        plt.scatter(G[:, i], P[:, i], alpha=0.4, color='blue')
-        plt.plot([G[:, i].min(), G[:, i].max()], [G[:, i].min(), G[:, i].max()], 'r--')
-        plt.xlabel("True Drift Magnitude")
-        plt.ylabel("Predicted Drift (H-DRIFT-M)")
+        plt.figure(figsize=(6, 6))
+        plt.scatter(G[:, i], P[:, i], alpha=0.3, s=10, label='Predicted Points')
+        plt.plot([0, 1], [0, 1], 'r--', label='Ideal Sensor Line') # Perfect Metrology
+        plt.xlabel("Ground Truth (Normalized)")
+        plt.ylabel("H-DRIFT-M Estimate")
         plt.title(f"Metrology Validation: {names[i]}")
-        plt.grid(True)
-        plt.savefig(os.path.join(cfg.save_dir, f"drift_scatter_{i}.png"))
+        plt.grid(True, alpha=0.2)
+        plt.legend()
+        plt.savefig(os.path.join(cfg.save_dir, f"metrology_scatter_{i}.png"), dpi=300)
         plt.close()
+    
+    print(f"Validation complete. Final graphs saved in {cfg.save_dir}")
 
 if __name__ == "__main__":
     main()
