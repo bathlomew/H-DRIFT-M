@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Data & outputs
+data/
+outputs_h_drift_m/
+
+# Models
+*.pt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scratch
+Untitled-1.ipynb
+
